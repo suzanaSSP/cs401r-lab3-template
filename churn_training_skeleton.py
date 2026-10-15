@@ -35,8 +35,10 @@ import pickle
 from datetime import datetime, timezone
 
 import boto3
+# pyrefly: ignore [missing-import]
 import numpy as np
 import pandas as pd
+import tarfile
 
 # SageMaker imports — available in SageMaker training containers.
 #
@@ -299,12 +301,12 @@ def load_features_from_feature_store(feature_group_name: str,
         ORDER BY customer_id
     """
 
-    # query.run(query_string=query_string,
-    #           output_location=f"s3://{artifacts_bucket}/artifacts/athena-results/")
-    # query.wait()
-    # df = query.as_dataframe()
-    # return df
-    raise NotImplementedError("TODO: Implement Feature Store query")
+    query.run(query_string=query_string,
+               output_location=f"s3://{artifacts_bucket}/artifacts/athena-results/")
+    print(f"Athena QueryExecutionId: {query.get_query_execution()['QueryExecution']['QueryExecutionId']}")
+    query.wait()
+    df = query.as_dataframe()
+    return df
 
 
 def load_features_local(path: str) -> pd.DataFrame:
@@ -583,24 +585,55 @@ def evaluate_slices(model: xgb.Booster,
                     y_val: np.ndarray,
                     slice_column: pd.Series) -> dict:
     """
-    Evaluate model performance by slice (e.g., loyalty_tier, age_band).
+    Evaluate model performance by slice (e.g., loyalty_tier).
     Flag slices where recall@10% drops more than 10pp below aggregate.
-
-    TODO: Implement this function in Lab 3.
     """
+    slice_series = pd.Series(slice_column)
     dval = xgb.DMatrix(X_val, feature_names=FEATURE_COLUMNS)
     y_pred_proba = model.predict(dval)
-    aggregate_recall = None  # TODO: compute
+
+    # 1. Compute aggregate recall @ top 10% across the full validation set
+    top10_threshold = np.percentile(y_pred_proba, 90)
+    top10_mask = y_pred_proba >= top10_threshold
+    aggregate_recall = float(y_val[top10_mask].sum() / y_val.sum()) if y_val.sum() > 0 else 0.0
+
+    print(f"\n── Slice Evaluation (Aggregate recall@10%: {aggregate_recall:.4f}) ──")
 
     slice_results = {}
-    for slice_value in slice_column.unique():
-        mask = (slice_column == slice_value).values
-        # TODO: compute recall@10% for this slice
-        # Flag if recall < aggregate_recall - 0.10
-        pass
+    for slice_value in slice_series.unique():
+        mask = (slice_series.values == slice_value)
+        y_slice = y_val[mask]
+        proba_slice = y_pred_proba[mask]
+
+        n_samples = int(mask.sum())
+        positives = int(y_slice.sum())
+
+        # Recall @ top 10% for this slice
+        captured = int(y_val[mask & top10_mask].sum())
+        slice_recall = float(captured / positives) if positives > 0 else 0.0
+
+        # AUC for this slice (if both churners and non-churners are present)
+        if len(np.unique(y_slice)) > 1:
+            slice_auc = float(roc_auc_score(y_slice, proba_slice))
+        else:
+            slice_auc = None
+
+        # Flag if recall drops more than 10 percentage points below aggregate
+        flagged = bool(slice_recall < (aggregate_recall - 0.10))
+
+        slice_results[str(slice_value)] = {
+            "n_samples": n_samples,
+            "n_positives": positives,
+            "recall_top10": round(slice_recall, 4),
+            "auc_roc": round(slice_auc, 4) if slice_auc is not None else None,
+            "flagged": flagged,
+        }
+
+        flag_str = "⚠ FLAGGED (>10pp drop)" if flagged else "✓ PASS"
+        auc_str = f"{slice_auc:.4f}" if slice_auc is not None else "N/A"
+        print(f"  Tier {str(slice_value):10s} | N: {n_samples:5d} | Recall@10%: {slice_recall:.4f} | AUC: {auc_str} | {flag_str}")
 
     return slice_results
-
 
 # ── Experiment Tracking (MLflow App) ───────────────────────────────────────────
 
@@ -643,25 +676,34 @@ def track_run(args, metrics: dict, scale_pos_weight: float) -> None:
 
     # TODO: log this run to the MLflow App.
     #
-    # import mlflow
-    #
-    # mlflow.set_tracking_uri(args.mlflow_arn)   # the App ARN, verbatim
-    # mlflow.set_experiment(args.mlflow_experiment)
-    #
-    # with mlflow.start_run(run_name=args.run_name):
-    #     mlflow.log_params({
-    #         "max_depth": args.max_depth,
-    #         "eta": args.eta,
-    #         "num_round": args.num_round,
-    #         "min_child_weight": args.min_child_weight,
-    #         "subsample": args.subsample,
-    #         "colsample_bytree": args.colsample_bytree,
-    #         "scale_pos_weight": scale_pos_weight,
-    #         "xgboost_version": xgb.__version__,   # see below -- this matters
-    #     })
-    #     mlflow.log_metrics({
-    #         k: v for k, v in metrics.items() if isinstance(v, (int, float))
-    #     })
+    # pyrefly: ignore [missing-import]
+    import mlflow
+    
+    mlflow.set_tracking_uri(args.mlflow_arn)   # the App ARN, verbatim
+    mlflow.set_experiment(args.mlflow_experiment)
+    
+    with mlflow.start_run(run_name=args.run_name):
+        mlflow.log_params({
+            "max_depth": args.max_depth,
+            "eta": args.eta,
+            "num_round": args.num_round,
+            "min_child_weight": args.min_child_weight,
+            "subsample": args.subsample,
+            "colsample_bytree": args.colsample_bytree,
+            "scale_pos_weight": scale_pos_weight,
+            "xgboost_version": xgb.__version__,   # see below -- this matters
+        })
+        mlflow.log_metrics({
+            k: v for k, v in metrics.items() if isinstance(v, (int, float))
+        })
+        
+        # Log slice-specific metrics if available
+        if "slices" in metrics:
+            for tier, tier_res in metrics["slices"].items():
+                mlflow.log_metric(f"recall_top10_{tier}", tier_res["recall_top10"])
+                if tier_res.get("auc_roc") is not None:
+                    mlflow.log_metric(f"auc_{tier}", tier_res["auc_roc"])
+    print(f"✓ Successfully logged run '{args.run_name}' to MLflow App")
     #
     # LOG THE XGBOOST VERSION AS A PARAM. Lab 3 documents that identical data
     # and an identical split produce different metrics on XGBoost 3.2.0 vs 1.7
@@ -673,9 +715,6 @@ def track_run(args, metrics: dict, scale_pos_weight: float) -> None:
     # hyperparameters and different seeds is the same experiment three times;
     # it earns 2 of 5. Vary something you can defend, and be able to say what
     # the variation did to the metrics.
-
-    print("TODO: Log run to MLflow App (see comments above)")
-
 
 # ── Model Saving & Registry ────────────────────────────────────────────────────
 
@@ -705,6 +744,7 @@ def save_and_register_model(model: xgb.Booster,
         "evaluation_metrics": metrics,
         "training_date": datetime.utcnow().isoformat(),
     }
+    
     with open(os.path.join(args.model_dir, "model_metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
@@ -713,19 +753,52 @@ def save_and_register_model(model: xgb.Booster,
     # from that group by name, so any other name breaks Lab 5.
     # Include the evaluation metrics in the model card / description
     # Status must be "PendingManualApproval" — never "Approved" from this script
-    #
-    # sm_client = boto3.client("sagemaker")
-    # sm_client.create_model_package(
-    #     ModelPackageGroupName="northstar-churn-models",
-    #     ModelPackageDescription=f"Churn model trained {datetime.utcnow().date()}",
-    #     InferenceSpecification={...},
-    #     ModelApprovalStatus="PendingManualApproval",
-    #     CustomerMetadataProperties={
-    #         k: str(v) for k, v in metrics.items()
-    #     },
-    # )
-    print("TODO: Register model in SageMaker Model Registry (see comments above)")
+    # 3. Package model as model.tar.gz for SageMaker
+    tar_path = os.path.join(args.model_dir, "model.tar.gz")
+    with tarfile.open(tar_path, "w:gz") as tar:
+        tar.add(model_path, arcname="model.xgb")
 
+    s3_client = boto3.client("s3")
+    s3_key = f"artifacts/models/{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}/model.tar.gz"
+    s3_client.upload_file(tar_path, args.artifacts_bucket, s3_key)
+    model_data_url = f"s3://{args.artifacts_bucket}/{s3_key}"
+    print(f"✓ Uploaded model artifact to {model_data_url}")
+
+    # 5. Ensure the Model Package Group exists
+    sm_client = boto3.client("sagemaker")
+    group_name = "northstar-churn-models"
+    try:
+        sm_client.describe_model_package_group(ModelPackageGroupName=group_name)
+    except sm_client.exceptions.ClientError:
+        sm_client.create_model_package_group(
+            ModelPackageGroupName=group_name,
+            ModelPackageGroupDescription="NorthStar churn prediction models"
+        )
+        print(f"✓ Created Model Package Group: {group_name}")
+        
+    # 6. Official SageMaker XGBoost 1.7-1 inference image for us-east-1
+    region = boto3.session.Session().region_name or "us-east-1"
+    image_uri = f"683313688378.dkr.ecr.{region}.amazonaws.com/sagemaker-xgboost:1.7-1"
+    # 7. Register the model in the Model Registry
+    response = sm_client.create_model_package(
+        ModelPackageGroupName=group_name,
+        ModelPackageDescription=f"Churn XGBoost model (AUC: {metrics.get('auc_roc', 'N/A')}) trained {datetime.utcnow().date()}",
+        InferenceSpecification={
+            "Containers": [
+                {
+                    "Image": image_uri,
+                    "ModelDataUrl": model_data_url,
+                }
+            ],
+            "SupportedContentTypes": ["text/csv"],
+            "SupportedResponseMIMETypes": ["text/csv"],
+        },
+        ModelApprovalStatus="PendingManualApproval",
+        CustomerMetadataProperties={
+            k: str(v) for k, v in metrics.items() if isinstance(v, (int, float, str))
+        },
+    )
+    print(f"✓ Model registered in SageMaker Model Registry: {response['ModelPackageArn']}")
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -764,8 +837,14 @@ def main():
     #   X_train, X_val, y_train, y_val, tier_train, tier_val = train_test_split(
     #       X, y, df[SLICE_COLUMN], test_size=0.30, random_state=42, stratify=y)
     # Re-deriving the tiers afterwards from df will NOT line up.
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.30, random_state=42, stratify=y
+        # 3. Stratified 70/30 train/test split
+    X_train, X_val, y_train, y_val, tier_train, tier_val = train_test_split(
+        X, 
+        y, 
+        df[SLICE_COLUMN].values, 
+        test_size=0.30, 
+        random_state=42, 
+        stratify=y
     )
     print(f"\nTrain: {len(X_train):,} | Validation: {len(X_val):,}")
 
@@ -775,6 +854,11 @@ def main():
     # 5. Evaluate
     baseline_proba = train_recency_baseline(X_train, y_train, X_val)
     metrics = evaluate_model(model, X_val, y_val, baseline_proba)
+
+    # Run slice evaluation for loyalty tiers
+    slice_metrics = evaluate_slices(model, X_val, y_val, tier_val)
+    metrics["slices"] = slice_metrics
+
 
     # 6. Save and register
     save_and_register_model(model, metrics, args)
