@@ -151,6 +151,19 @@ resource "aws_iam_role_policy" "gateway" {
       # and Policy in AgentCore IAM Permissions" (Gateway Execution Role) and
       # add them all at once instead. Scope Resource to the policy engine ARN
       # and local.gateway_glob.
+      {
+        Sid    = "AuthorizePolicyEngine"
+        Effect = "Allow"
+        Action = [
+          "bedrock-agentcore:GetPolicyEngine",
+          "bedrock-agentcore:AuthorizeAction",
+          "bedrock-agentcore:PartiallyAuthorizeActions",
+        ]
+        Resource = [
+          aws_bedrockagentcore_policy_engine.this.policy_engine_arn,
+          local.gateway_glob,
+        ]
+      },
     ]
   })
 }
@@ -242,6 +255,27 @@ resource "aws_bedrockagentcore_policy" "permit_tools" {
 # Symptom if missing: python agent/policy_tests.py reports BAD for the $51 and
 # $75 credits, which the gateway allows.
 
+resource "aws_bedrockagentcore_policy" "cap_loyalty_credit" {
+  name             = "cap_loyalty_credit"
+  policy_engine_id = aws_bedrockagentcore_policy_engine.this.policy_engine_id
+  validation_mode  = "FAIL_ON_ANY_FINDINGS"
+  definition {
+    cedar {
+      statement = <<-CEDAR
+        forbid (
+          principal,
+          action == AgentCore::Action::"${local.target_name}___apply_loyalty_credit",
+          resource == AgentCore::Gateway::"${aws_bedrockagentcore_gateway.this.gateway_arn}"
+        )
+        when {
+          context.input.amount > ${var.credit_cap_dollars}
+        };
+      CEDAR
+    }
+  }
+  depends_on = [aws_bedrockagentcore_policy.permit_tools]
+}
+
 # ---------------------------------------------------------------------------
 # Harness and its execution role
 # ---------------------------------------------------------------------------
@@ -293,6 +327,12 @@ resource "aws_iam_role_policy" "harness" {
       # Add the one statement that allows it, scoped to this gateway's ARN.
       # Symptom if missing: every invocation fails with "Failed to load tool
       # 'northstar_tools' ... 403 Forbidden" on the gateway URL.
+      {
+        Sid      = "InvokeAgentCoreGateway"
+        Effect   = "Allow"
+        Action   = "bedrock-agentcore:InvokeGateway"
+        Resource = aws_bedrockagentcore_gateway.this.gateway_arn
+      },
     ]
   })
 }

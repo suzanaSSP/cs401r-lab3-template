@@ -1,0 +1,7 @@
+run,session_id,input_tokens,output_tokens,model_cost_usd,runtime_cost_est_usd,total_est_usd,tool_calls,stop_reason,seconds
+eval-1,test-TC-001-1792172427-35a8b572-b289-4238-b732-9179ebdf17fe,4171,205,0.005716,0.0033,0.009016,1,end_turn,4.5
+eval-1,test-TC-002-1792172432-ca49aedb-df00-459b-bb9b-14f88f67e4d3,7693,421,0.010778,0.0033,0.014078,2,end_turn,8.9
+eval-1,test-TC-003-1792172441-0fc06008-a5bc-4b03-8a00-678bed414fe2,4780,359,0.007233,0.0033,0.010533,1,end_turn,7.8
+eval-1,test-TC-004-1792172448-9e18d780-7b7b-473d-bcd3-4415c2a94a27,1976,122,0.002845,0.0033,0.006145,0,end_turn,3.3
+eval-1,test-TC-005-1792172452-7eb4ff48-f6a2-4c0f-bbeb-41a7cf062fd3,4850,383,0.007442,0.0033,0.010742,1,end_turn,6.6
+eval-1,test-TC-006-1792172458-958c78c5-f2ee-4c0d-8e17-180d486fc74e,1994,158,0.003062,0.0033,0.006362,0,end_turn,3.1
