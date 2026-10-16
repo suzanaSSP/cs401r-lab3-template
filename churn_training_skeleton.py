@@ -841,7 +841,7 @@ def main():
     X_train, X_val, y_train, y_val, tier_train, tier_val = train_test_split(
         X, 
         y, 
-        df[SLICE_COLUMN].values, 
+        df[SLICE_COLUMN], 
         test_size=0.30, 
         random_state=42, 
         stratify=y
